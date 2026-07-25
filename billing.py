@@ -4,7 +4,7 @@ from datetime import datetime, date, timedelta
 
 from sqlalchemy import select, and_, func
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from models import User, UsageLog
 
@@ -75,7 +75,7 @@ async def check_and_increment(session: AsyncSession, user: User, is_media: bool 
 async def _increment_usage(session: AsyncSession, user_id: int, is_media: bool) -> None:
     today = date.today()
     stmt = (
-        sqlite_insert(UsageLog)
+        pg_insert(UsageLog)
         .values(user_id=user_id, date=today, messages_count=0, media_count=0)
         .on_conflict_do_update(
             index_elements=["user_id", "date"],

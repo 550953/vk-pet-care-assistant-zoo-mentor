@@ -7,7 +7,7 @@ from typing import Optional
 
 from sqlalchemy import select, delete, and_
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from models import Memory, PendingConfirmation, ChatMessage, Pet, User, UserState
 from prompt import SENSITIVE_KEYS, CATEGORY_LABELS
@@ -83,7 +83,7 @@ def _parse_age_to_birth_date(text: str) -> Optional[date]:
 async def upsert_memory(session: AsyncSession, pet_id: int, category: str, key: str, value: str, confidence: float = 1.0) -> None:
     """Write or update a non-sensitive fact directly."""
     stmt = (
-        sqlite_insert(Memory)
+        pg_insert(Memory)
         .values(pet_id=pet_id, category=category, key=key, value=value, sensitive=False, confidence=confidence, updated=datetime.utcnow())
         .on_conflict_do_update(
             index_elements=["pet_id", "category", "key"],
@@ -143,7 +143,7 @@ async def confirm_pending(session: AsyncSession, pet_id: int, confirm_id: int) -
         return False
 
     stmt = (
-        sqlite_insert(Memory)
+        pg_insert(Memory)
         .values(pet_id=pet_id, category=conf.category, key=conf.key, value=conf.new_value,
                 sensitive=True, confidence=1.0, updated=datetime.utcnow())
         .on_conflict_do_update(

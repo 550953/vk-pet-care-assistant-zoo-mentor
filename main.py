@@ -124,11 +124,21 @@ async def _on_keys_exhausted(service: str) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global vk, _admin_vk_id
+
+    # ── Load secrets from Infisical FIRST (нужен DATABASE_URL до init_db) ──
+    infisical_secrets = await load_infisical_secrets()
+
+    if infisical_secrets:
+        # Supabase connection string → DATABASE_URL (для db.py)
+        db_url = infisical_secrets.get("SUPABASE_CP_babfrost2pdc9_zoo-mentor", "").strip()
+        if db_url:
+            os.environ["DATABASE_URL"] = db_url
+            logger.info("DATABASE_URL: загружен из Infisical (Supabase)")
+        else:
+            logger.error("Infisical: SUPABASE_CP_babfrost2pdc9_zoo-mentor не найден!")
+
     await init_db()
     logger.info("Database initialised")
-
-    # ── Load secrets from Infisical ────────────────────────────────────────
-    infisical_secrets = await load_infisical_secrets()
 
     if infisical_secrets:
         # Gemini key pool
