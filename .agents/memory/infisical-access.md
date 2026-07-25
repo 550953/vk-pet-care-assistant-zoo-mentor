@@ -39,6 +39,22 @@ curl -s "https://app.infisical.com/api/v3/secrets/raw?workspaceId=555e71be-4c53-
 **How to apply:**
 Запускать через `ShellExec`. Если нужны конкретные ключи — фильтровать через `.filter(s=>keys.includes(s.secretKey))` в node-пайпе.
 
+## Git remote → GitHub
+
+Репозиторий: `https://github.com/550953/vk-pet-care-assistant-zoo-mentor.git`  
+Токен хранится в Replit Secret `GITHUB_TOKEN`.  
+Remote `origin` настроен как:
+```
+https://$GITHUB_TOKEN@github.com/550953/vk-pet-care-assistant-zoo-mentor.git
+```
+Git user: `550953 <550953@users.noreply.github.com>`  
+Push через: `git push origin main`
+
+**Why:** Fine-grained PAT работает только через HTTPS, не через SSH (`git@github.com`).  
+При смене токена: `git remote set-url origin "https://<новый_токен>@github.com/550953/vk-pet-care-assistant-zoo-mentor.git"`
+
+---
+
 ## Найденные Supabase-реквизиты (amelitacoffey4d162)
 - `SUPABASE_CP_amelitacoffey4d162` — полная строка подключения PostgreSQL
 - `SUPABASE_URL_amelitacoffey4d162` — `https://tqbljevvatiqvqodqmkq.supabase.co`
