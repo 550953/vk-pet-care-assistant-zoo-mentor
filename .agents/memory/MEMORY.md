@@ -1,0 +1,1 @@
+- [Infisical access](infisical-access.md) — shell-скрипт получения секретов через universal-auth + project ID + найденные Supabase-реквизиты
