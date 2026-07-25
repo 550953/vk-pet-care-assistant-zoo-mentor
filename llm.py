@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 # ─── Конфиг ───────────────────────────────────────────────────────────────────
 
-MODEL = "gemini-flash-latest"
+MODEL = "gemini-2.5-flash"
 
 # Строго 1 одновременный LLM-запрос — ключи никогда не бьются параллельно
 _LLM_SEMAPHORE = asyncio.Semaphore(1)
