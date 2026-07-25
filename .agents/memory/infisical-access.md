@@ -53,6 +53,9 @@ Push через: `git push origin main`
 **Why:** Fine-grained PAT работает только через HTTPS, не через SSH (`git@github.com`).  
 При смене токена: `git remote set-url origin "https://<новый_токен>@github.com/550953/vk-pet-care-assistant-zoo-mentor.git"`
 
+**Как попросить в следующий раз:**  
+> «Настрой git push в репозиторий `github.com/550953/...` — токен в `GITHUB_TOKEN`»
+
 ---
 
 ## Найденные Supabase-реквизиты (amelitacoffey4d162)
