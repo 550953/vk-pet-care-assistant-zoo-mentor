@@ -3,8 +3,13 @@ Gemini API — минимальная надёжная реализация.
 Два рабочих ключа, Round-Robin, защита от 429.
 Задача 4: failover-уведомления, логирование ApiKeyEvent в БД.
 
-SDK: google-genai
-Модель: gemini-flash-latest
+SDK: google-genai>=2.14.0 (Gemini 3.x требует thinking_level вместо thinking_budget)
+Модель: gemini-3.5-flash (закреплена явно — не используем "-latest" алиасы,
+т.к. Google может молча сменить модель за ними на несовместимую по API,
+как это произошло 2026-07 с gemini-flash-latest → gemini-3.5-flash.
+gemini-2.5-flash не используем: он уже недоступен новым Google-аккаунтам,
+а в пуле ключей есть и старые, и новые аккаунты — нужна модель,
+доступная всем одинаково)
 """
 import asyncio
 import json
@@ -28,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 # ─── Конфиг ───────────────────────────────────────────────────────────────────
 
-MODEL = "gemini-2.5-flash"
+MODEL = "gemini-3.5-flash"
 
 # Строго 1 одновременный LLM-запрос — ключи никогда не бьются параллельно
 _LLM_SEMAPHORE = asyncio.Semaphore(1)
@@ -425,7 +430,7 @@ async def _analyze_one_photo(
             system_instruction=system,
             temperature=0.7,
             max_output_tokens=4096,
-            thinking_config=types.ThinkingConfig(thinking_budget=0),
+            thinking_config=types.ThinkingConfig(thinking_level="minimal"),
         ),
     )
 
@@ -453,7 +458,7 @@ async def _synthesize_photo_analyses(
         config=types.GenerateContentConfig(
             temperature=0.7,
             max_output_tokens=2048,
-            thinking_config=types.ThinkingConfig(thinking_budget=0),
+            thinking_config=types.ThinkingConfig(thinking_level="minimal"),
         ),
     )
 
@@ -568,7 +573,7 @@ async def generate_response(
         config=types.GenerateContentConfig(
             system_instruction=system,
             temperature=0.7,
-            thinking_config=types.ThinkingConfig(thinking_budget=0),
+            thinking_config=types.ThinkingConfig(thinking_level="minimal"),
             max_output_tokens=4096,
         ),
     )
@@ -594,7 +599,7 @@ async def extract_facts(
                 response_mime_type="application/json",
                 # Отключаем thinking: без этого gemini-flash-latest тратит токены на
                 # внутренние размышления, оставляя ~28 токенов на JSON → Unterminated string
-                thinking_config=types.ThinkingConfig(thinking_budget=0),
+                thinking_config=types.ThinkingConfig(thinking_level="minimal"),
             ),
         )
         raw = raw.strip()
@@ -623,7 +628,7 @@ async def classify_triage(
                 temperature=0.1,
                 max_output_tokens=512,
                 response_mime_type="application/json",
-                thinking_config=types.ThinkingConfig(thinking_budget=0),
+                thinking_config=types.ThinkingConfig(thinking_level="minimal"),
             ),
         )
         raw = raw.strip()
@@ -646,7 +651,7 @@ async def classify_intent(message: str) -> dict:
                 temperature=0.0,
                 max_output_tokens=512,
                 response_mime_type="application/json",
-                thinking_config=types.ThinkingConfig(thinking_budget=0),
+                thinking_config=types.ThinkingConfig(thinking_level="minimal"),
             ),
         )
         raw = raw.strip()
