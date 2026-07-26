@@ -135,9 +135,28 @@ class ApiKeyEvent(Base):
     __tablename__ = "api_key_events"
 
     id = Column(Integer, primary_key=True)
-    service = Column(String, nullable=False)    # gemini / groq / tavily
+    service = Column(String, nullable=False)    # gemini / groq / tavily / gigachat
     key_name = Column(String, nullable=False)   # напр. GROQ_API_KEY_550953 или ALL
     status = Column(String, nullable=False)     # error_429 / error_auth / error_server /
                                                 # error_network / error_unknown / all_keys_exhausted
     error_text = Column(Text, nullable=True)
     created = Column(DateTime, default=datetime.utcnow)
+
+
+class GigaChatUsage(Base):
+    """
+    Учёт использования GigaChat (fallback LLM) — годовой freemium-лимит
+    физлиц не самовозобновляемый помесячно, поэтому важно знать остаток
+    заранее, а не по факту отказа API.
+    """
+    __tablename__ = "gigachat_usage"
+
+    id = Column(Integer, primary_key=True)
+    date = Column(Date, nullable=False)
+    model = Column(String, nullable=False)          # GigaChat-2 / GigaChat-2-Pro и т.д.
+    input_tokens = Column(Integer, nullable=False, default=0)
+    output_tokens = Column(Integer, nullable=False, default=0)
+    requests = Column(Integer, nullable=False, default=0)
+    created = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (UniqueConstraint("date", "model", name="uq_gigachat_usage_date_model"),)

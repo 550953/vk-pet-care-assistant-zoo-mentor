@@ -19,9 +19,10 @@ from datetime import datetime
 
 from fastapi import FastAPI, Request, Response
 import uvicorn
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from db import init_db, async_session
-from models import User, Pet, ApiKeyEvent
+from models import User, Pet, ApiKeyEvent, GigaChatUsage
 from billing import ensure_user, check_and_increment
 from memory import (
     get_user_state_data, set_user_state,
@@ -40,6 +41,10 @@ from scheduler import setup_scheduler
 from infisical_loader import load_infisical_secrets, extract_gemini_keys
 from groq_client import init_groq_pool, transcribe_audio, is_groq_available
 from tavily_client import init_tavily_pool, search as tavily_search, is_tavily_available
+from gigachat_client import (
+    init_gigachat_pool, set_usage_callback as set_gigachat_usage_cb,
+    set_budget_warning_callback as set_gigachat_budget_cb, is_gigachat_available,
+)
 import key_pool as kp
 import handlers
 import aiohttp
@@ -88,6 +93,60 @@ async def _db_log_key_event(service: str, key_name: str, status: str, error_text
         logger.debug("ApiKeyEvent: %s / %s / %s", service, key_name, status)
     except Exception as e:
         logger.error("Не удалось записать ApiKeyEvent: %s", e)
+
+
+# ─── GigaChat: учёт токенов (годовой freemium-лимит, не помесячный) ──────────
+# Сама проверка бюджета (gigachat_budget_ok) живёт в gigachat_client.py —
+# здесь только запись в БД, т.к. только main.py открывает сессии для
+# фонового логирования (тот же паттерн, что и у _db_log_key_event выше).
+
+async def _record_gigachat_usage(model: str, input_tokens: int, output_tokens: int) -> None:
+    """UPSERT дневной статистики использования GigaChat по (date, model)."""
+    try:
+        today = datetime.utcnow().date()
+        async with async_session() as session:
+            stmt = pg_insert(GigaChatUsage).values(
+                date=today,
+                model=model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                requests=1,
+            )
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["date", "model"],
+                set_={
+                    "input_tokens": GigaChatUsage.input_tokens + input_tokens,
+                    "output_tokens": GigaChatUsage.output_tokens + output_tokens,
+                    "requests": GigaChatUsage.requests + 1,
+                },
+            )
+            await session.execute(stmt)
+            await session.commit()
+        logger.debug("GigaChatUsage: %s in=%d out=%d", model, input_tokens, output_tokens)
+    except Exception as e:
+        logger.error("Не удалось записать GigaChatUsage: %s", e)
+
+
+async def _gigachat_usage_ytd(model: str) -> int:
+    """
+    Суммарные токены (in+out) по модели за всё время учёта.
+
+    ПРИБЛИЖЕНИЕ: считаем от начала таблицы, а не от точной даты активации
+    годового freemium-лимита GigaChat (эта дата нам неизвестна) — если разница
+    станет критичной, скорректировать вручную по факту первого запроса к GigaChat.
+    """
+    try:
+        async with async_session() as session:
+            result = await session.execute(
+                select(
+                    func.coalesce(func.sum(GigaChatUsage.input_tokens), 0)
+                    + func.coalesce(func.sum(GigaChatUsage.output_tokens), 0)
+                ).where(GigaChatUsage.model == model)
+            )
+            return int(result.scalar() or 0)
+    except Exception as e:
+        logger.error("Не удалось прочитать GigaChatUsage: %s", e)
+        return 0
 
 
 async def _on_key_failover(vk_id: int, service: str) -> None:
@@ -157,6 +216,16 @@ async def lifespan(app: FastAPI):
             logger.info("Tavily: пул ключей инициализирован")
         else:
             logger.warning("Tavily: TAVILY_API_KEY_* не найдены в Infisical — поиск отключён")
+
+        # GigaChat key pool — резервный LLM, срабатывает только когда Gemini
+        # полностью в blackout (см. llm.is_overloaded() + правки в llm.py)
+        init_gigachat_pool(infisical_secrets)
+        set_gigachat_usage_cb(_record_gigachat_usage)
+        set_gigachat_budget_cb(_on_keys_exhausted)  # переиспользуем существующее уведомление админу
+        if is_gigachat_available():
+            logger.info("GigaChat: пул ключей инициализирован (fallback LLM)")
+        else:
+            logger.warning("GigaChat: GIGACHAT_AUTH_KEY_* не найдены в Infisical — резервный LLM отключён")
 
         # VK credentials from Infisical
         vk_token_inf = infisical_secrets.get("VK_TOKEN", "")

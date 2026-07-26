@@ -28,6 +28,11 @@ from prompt import (
     build_triage_prompt, build_intent_prompt,
     EXTRACTION_SCHEMA, TRIAGE_SCHEMA, INTENT_SCHEMA,
 )
+# GigaChat — резервный LLM, вызывается ТОЛЬКО когда Gemini полностью
+# в глобальном blackout (is_overloaded() == True). Импорт лёгкий,
+# сам пул может быть пустым (не настроен) — это ОК, generate_gigachat
+# в этом случае просто вернёт (None, "GigaChat не настроен").
+from gigachat_client import generate_gigachat, gigachat_budget_ok
 
 logger = logging.getLogger(__name__)
 
@@ -491,6 +496,41 @@ async def generate_response(
         num_photos, bool(user_text), len(media_items or []),
     )
 
+    # ── GigaChat fallback: Gemini полностью в blackout ──────────────────────
+    # Проверяем ДО вызова Gemini — если ключи всё равно все на cooldown,
+    # незачем тратить попытку и ждать, сразу пробуем резервный LLM.
+    overloaded, wait_secs = is_overloaded()
+    if overloaded:
+        if media_items:
+            # GigaChat не обрабатывает фото/аудио/PDF — честно говорим об этом,
+            # а не пытаемся молча ответить только по тексту без учёта media.
+            s = f"{math.ceil(wait_secs / 60)} мин." if wait_secs >= 60 else f"{math.ceil(wait_secs)} сек."
+            return (
+                f"⌛ Ева сейчас не может разобрать фото/аудио, перегружена. "
+                f"Попробуй через {s}, либо напиши вопрос текстом — на него смогу ответить сразу."
+            )
+        gc_model = "GigaChat-2"
+        if not await gigachat_budget_ok(gc_model):
+            logger.warning("generate_response: годовой лимит GigaChat исчерпан — пропускаем fallback")
+        else:
+            gc_text, gc_err = await generate_gigachat(
+                prompt=user_text or "Продолжи диалог по контексту.",
+                system=build_system_prompt(
+                    pet_name=pet_name, species=species, pet_facts=pet_facts,
+                    other_pets_hint=other_pets_hint, history=history,
+                    scope_instruction=scope_instruction, emergency_active=emergency_active,
+                    num_photos=0, web_search_context=web_search_context,
+                    toxicology_active=toxicology_active,
+                ),
+                model=gc_model,
+            )
+            if gc_text:
+                logger.info("generate_response: ответил GigaChat (Gemini в blackout)")
+                return gc_text
+            logger.warning("generate_response: GigaChat тоже недоступен (%s) — обычная заглушка", gc_err)
+        # GigaChat не смог/лимит исчерпан — падаем в обычный путь ниже, он вернёт
+        # _stub() с корректным временем ожидания через is_overloaded()-проверку в _call().
+
     if num_photos > 1:
         photo_items = [(d, m) for d, m in (media_items or []) if m.startswith("image/")]
 
@@ -568,15 +608,29 @@ async def generate_response(
     for data, mime in (media_items or []):
         contents.append(types.Part.from_bytes(data=data, mime_type=mime))
 
-    return await _call(
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=system,
-            temperature=0.7,
-            thinking_config=types.ThinkingConfig(thinking_level="minimal"),
-            max_output_tokens=4096,
-        ),
-    )
+    try:
+        return await _call(
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=system,
+                temperature=0.7,
+                thinking_config=types.ThinkingConfig(thinking_level="minimal"),
+                max_output_tokens=4096,
+            ),
+        )
+    except Exception as exc:
+        # Последний шанс перед тем, как main.py покажет пользователю
+        # общую заглушку "Произошла ошибка при обработке запроса" —
+        # пробуем GigaChat, только если это чистый текст без media.
+        if media_items:
+            raise
+        logger.warning("generate_response: Gemini упал (%s), пробуем GigaChat как последний шанс", exc)
+        gc_text, gc_err = await generate_gigachat(prompt=user_text or "Продолжи диалог по контексту.", system=system)
+        if gc_text:
+            logger.info("generate_response: спасены GigaChat после сбоя Gemini")
+            return gc_text
+        logger.warning("generate_response: GigaChat тоже не смог (%s) — пробрасываем исходную ошибку", gc_err)
+        raise
 
 
 async def extract_facts(
