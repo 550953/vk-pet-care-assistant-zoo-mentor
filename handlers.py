@@ -24,6 +24,7 @@ from memory import (
 from billing import get_subscription_info
 from prompt import SPECIES_ALLOWLIST, CATEGORY_LABELS
 from vk_client import VKClient, pets_keyboard, yes_no_keyboard, main_menu_keyboard, species_keyboard
+from logging_setup import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -256,6 +257,12 @@ async def fsm_awaiting_pet_age(
     await session.commit()
 
     await set_user_state(session, user.id, None)
+
+    log_event(
+        logger, logging.INFO, "pet_created",
+        pet_id=pet.id, pet_name=name, species=species,
+        birth_date=birth_date.isoformat() if birth_date else None,
+    )
 
     age_str = ""
     if birth_date:
@@ -549,7 +556,14 @@ async def fsm_awaiting_remind_time(
     )
     session.add(reminder)
     await session.commit()
+    await session.refresh(reminder)
     await set_user_state(session, user.id, None)
+
+    log_event(
+        logger, logging.INFO, "reminder_created",
+        reminder_id=reminder.id, pet_id=user.active_pet_id,
+        text=remind_text[:200], repeat_rule=repeat_rule or "once",
+    )
 
     fire_str = next_fire.strftime("%d.%m.%Y %H:%M")
     repeat_label = {"once": "", "monthly": " (ежемесячно)", "yearly": " (ежегодно)"}.get(repeat_rule or "once", "")
@@ -740,6 +754,13 @@ async def handle_confirm_callback(
     cmid: int = 0,
 ) -> None:
     action = payload.get("action")
+
+    log_event(
+        logger, logging.INFO, "button_pressed",
+        peer_id=vk_id, callback_data=action,
+        # payload может содержать pet_id/confirm id — не PII, но текст факта не логируем здесь
+        payload_keys=list(payload.keys()) if payload else None,
+    )
 
     # Always acknowledge the callback to dismiss VK's loading spinner
     await vk.send_event_answer(event_id=event_id, user_id=vk_id, peer_id=peer_id or vk_id)
