@@ -11,6 +11,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from models import Memory, PendingConfirmation, ChatMessage, Pet, User, UserState
 from prompt import SENSITIVE_KEYS, CATEGORY_LABELS
+from logging_setup import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +154,11 @@ async def confirm_pending(session: AsyncSession, pet_id: int, confirm_id: int) -
     )
     await session.execute(stmt)
     await session.execute(delete(PendingConfirmation).where(PendingConfirmation.id == confirm_id))
+
+    log_event(
+        logger, logging.INFO, "fact_confirmed",
+        pet_id=pet_id, key=conf.key, value=conf.new_value, sensitive=True,
+    )
 
     # Синхронизируем Pet-поля при подтверждении чувствительных фактов.
     # Пол и возраст хранятся ТОЛЬКО в Pet (не дублируются в Memory) —
@@ -361,10 +367,17 @@ async def get_or_create_user_state(session: AsyncSession, user_id: int) -> UserS
 
 async def set_user_state(session: AsyncSession, user_id: int, state: Optional[str], data: Optional[dict] = None) -> None:
     us = await get_or_create_user_state(session, user_id)
+    from_state = us.state
     us.state = state
     us.state_data = json.dumps(data, ensure_ascii=False) if data else None
     us.updated = datetime.utcnow()
     await session.commit()
+
+    if from_state != state:
+        log_event(
+            logger, logging.INFO, "state_changed",
+            from_state=from_state, to_state=state,
+        )
 
 
 async def get_user_state_data(session: AsyncSession, user_id: int) -> tuple[Optional[str], dict]:

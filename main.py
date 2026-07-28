@@ -422,10 +422,6 @@ async def handle_message(msg: dict) -> None:
         # ── Explicit commands ──────────────────────────────────────────────
         lower = text.lower()
 
-        if lower.startswith("/start"):
-            await handlers.handle_start(vk, session, user, vk_id)
-            return
-
         _BUTTON_MAP = {
             "🐾 мой питомец": "/me",
             "➕ добавить питомца": "/addpet",
@@ -436,7 +432,22 @@ async def handle_message(msg: dict) -> None:
         }
         mapped = _BUTTON_MAP.get(lower.strip())
         if mapped:
+            log_event(
+                logger, logging.INFO, "button_pressed",
+                peer_id=vk_id, button_text=text.strip(), callback_data=mapped,
+            )
             lower = mapped
+        elif lower.startswith("/"):
+            parts = text.strip().split(maxsplit=1)
+            log_event(
+                logger, logging.INFO, "command_used",
+                peer_id=vk_id, command=parts[0].lower(),
+                args=parts[1][:100] if len(parts) > 1 else None,
+            )
+
+        if lower.startswith("/start"):
+            await handlers.handle_start(vk, session, user, vk_id)
+            return
 
         if lower.startswith("/addpet"):
             await handlers.handle_addpet(vk, session, user, vk_id)
@@ -943,6 +954,9 @@ async def handle_callback_event(obj: dict) -> None:
 
     if not vk_id:
         return
+
+    new_correlation_id()
+    set_peer_id(vk_id)
 
     try:
         payload = json.loads(payload_raw) if isinstance(payload_raw, str) else payload_raw
