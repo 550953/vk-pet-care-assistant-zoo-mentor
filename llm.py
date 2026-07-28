@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 # ─── Конфиг ───────────────────────────────────────────────────────────────────
 
-MODEL = "gemini-3.5-flash"
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
 
 # Строго 1 одновременный LLM-запрос — ключи никогда не бьются параллельно
 _LLM_SEMAPHORE = asyncio.Semaphore(1)
@@ -138,9 +138,15 @@ def init_key_pool(source: Any) -> None:
     source = list  — список строк-ключей напрямую.
     source = str   — одиночный ключ.
     """
-    global _keys, _key_names, _clients, _blocked, _blackout_until, _rr_index
+    global _keys, _key_names, _clients, _blocked, _blackout_until, _rr_index, MODEL
 
     if isinstance(source, dict):
+        if source.get("GEMINI_MODEL"):
+            MODEL = source["GEMINI_MODEL"].strip()
+            logger.info("LLM init: переключена модель на %s из Infisical", MODEL)
+        elif os.environ.get("GEMINI_MODEL"):
+            MODEL = os.environ["GEMINI_MODEL"].strip()
+            logger.info("LLM init: переключена модель на %s из env", MODEL)
         seen: set[str] = set()
         extracted: list[str] = []
         names: list[str] = []

@@ -200,6 +200,8 @@ async def lifespan(app: FastAPI):
     logger.info("Database initialised")
 
     if infisical_secrets:
+        if "GEMINI_MODEL" in infisical_secrets:
+            os.environ["GEMINI_MODEL"] = infisical_secrets["GEMINI_MODEL"].strip()
         # Gemini key pool
         init_key_pool(infisical_secrets)
 
