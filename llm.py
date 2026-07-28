@@ -23,6 +23,9 @@ from typing import Optional, Any, Callable, Awaitable
 from google import genai
 from google.genai import types
 
+from langfuse import observe, propagate_attributes
+
+from observability import langfuse
 from prompt import (
     build_system_prompt, build_extraction_prompt,
     build_triage_prompt, build_intent_prompt,
@@ -208,6 +211,33 @@ def _ensure_keys() -> bool:
     return False
 
 
+# ─── Langfuse: безопасная сериализация contents/config для трейсов ───────────
+# (Part.from_bytes содержит сырые байты картинок — их в трейс не кладём,
+# только mime_type, чтобы не раздувать/не ронять сериализацию в Langfuse)
+
+def _summarize_contents(contents: list[Any], system_instruction: Optional[str] = None) -> list[dict]:
+    messages: list[dict] = []
+    if system_instruction:
+        messages.append({"role": "system", "content": system_instruction})
+    for item in contents:
+        if isinstance(item, str):
+            messages.append({"role": "user", "content": item})
+        else:
+            mime = getattr(getattr(item, "inline_data", None), "mime_type", None) or "media"
+            messages.append({"role": "user", "content": f"[media: {mime}]"})
+    return messages
+
+
+def _summarize_config(config: "types.GenerateContentConfig") -> dict:
+    thinking = getattr(config, "thinking_config", None)
+    return {
+        "temperature": getattr(config, "temperature", None),
+        "max_output_tokens": getattr(config, "max_output_tokens", None),
+        "thinking_level": getattr(thinking, "thinking_level", None),
+        "response_mime_type": getattr(config, "response_mime_type", None),
+    }
+
+
 # ─── Ядро: вызов с Round-Robin и защитой от 429 ───────────────────────────────
 
 async def _call(
@@ -273,100 +303,126 @@ async def _call_inner(
         tried.add(idx)
 
         client = _lazy_client(idx)
+        key_name = _key_names[idx] if idx < len(_key_names) else f"gemini_key_{idx}"
 
         for attempt in range(2):
-            try:
-                resp = await client.aio.models.generate_content(
-                    model=MODEL,
-                    contents=contents,
-                    config=config,
-                )
-                # Логируем токены и finish_reason для диагностики
+            propagate_kwargs: dict[str, Any] = {"tags": ["gemini", MODEL]}
+            if _current_vk_id:
+                propagate_kwargs["user_id"] = str(_current_vk_id)
+
+            with langfuse.start_as_current_observation(
+                as_type="generation",
+                name="gemini-generate-content",
+                model=MODEL,
+                input=_summarize_contents(contents, getattr(config, "system_instruction", None)),
+                model_parameters=_summarize_config(config),
+                metadata={"key_name": key_name, "attempt": attempt},
+            ) as generation:
+              with propagate_attributes(**propagate_kwargs):
                 try:
-                    reason = resp.candidates[0].finish_reason if resp.candidates else None
-                    usage = getattr(resp, "usage_metadata", None)
-                    in_tok  = getattr(usage, "prompt_token_count", "?")
-                    out_tok = getattr(usage, "candidates_token_count", "?")
-                    logger.info("LLM tokens: in=%s out=%s finish=%s", in_tok, out_tok, reason)
-                    if reason and str(reason) not in ("FinishReason.STOP", "STOP", "1"):
-                        logger.warning("LLM: finish_reason=%s — ответ обрезан!", reason)
-                except Exception:
-                    pass
-                return resp.text or "Произошла ошибка, попробуй ещё раз."
-
-            except Exception as exc:
-                err_str = str(exc)
-                err_up  = err_str.upper()
-                key_name = _key_names[idx] if idx < len(_key_names) else f"gemini_key_{idx}"
-
-                # ── 429 / лимит запросов ──────────────────────────────────────
-                if "429" in err_up or "RESOURCE_EXHAUSTED" in err_up:
-                    base     = _parse_retry(err_str)
-                    cooldown = max(_BLACKOUT_MIN, base * _BLACKOUT_MULT)
-                    _blocked[idx] = time.monotonic() + cooldown
-                    logger.warning(
-                        "LLM: ключ %s → 429, cooldown %.0f с", key_name, cooldown
+                    resp = await client.aio.models.generate_content(
+                        model=MODEL,
+                        contents=contents,
+                        config=config,
                     )
+                    # Логируем токены и finish_reason для диагностики
+                    reason = None
+                    in_tok = out_tok = None
+                    try:
+                        reason = resp.candidates[0].finish_reason if resp.candidates else None
+                        usage = getattr(resp, "usage_metadata", None)
+                        in_tok  = getattr(usage, "prompt_token_count", None)
+                        out_tok = getattr(usage, "candidates_token_count", None)
+                        logger.info("LLM tokens: in=%s out=%s finish=%s", in_tok, out_tok, reason)
+                        if reason and str(reason) not in ("FinishReason.STOP", "STOP", "1"):
+                            logger.warning("LLM: finish_reason=%s — ответ обрезан!", reason)
+                    except Exception:
+                        pass
 
-                    # Логируем в БД
-                    if _db_log_cb:
-                        _fire_callback(_db_log_cb("gemini", key_name, "error_429", err_str[:500]))
+                    output_text = resp.text or "Произошла ошибка, попробуй ещё раз."
+                    generation.update(
+                        output=output_text,
+                        usage_details=(
+                            {"input": in_tok, "output": out_tok}
+                            if in_tok is not None and out_tok is not None else None
+                        ),
+                        metadata={"finish_reason": str(reason)},
+                    )
+                    return output_text
 
-                    # Проверяем: заблокированы ли ВСЕ ключи?
-                    now3 = time.monotonic()
-                    if all(now3 < t for t in _blocked):
-                        # Blackout = до момента когда самый поздний ключ освободится
-                        new_blackout = max(_blocked)
-                        if new_blackout > _blackout_until:
-                            _blackout_until = new_blackout
-                        wait = _blackout_until - now3
+                except Exception as exc:
+                    err_str = str(exc)
+                    err_up  = err_str.upper()
+                    generation.update(level="ERROR", status_message=err_str[:500])
+
+                    # ── 429 / лимит запросов ──────────────────────────────────
+                    if "429" in err_up or "RESOURCE_EXHAUSTED" in err_up:
+                        base     = _parse_retry(err_str)
+                        cooldown = max(_BLACKOUT_MIN, base * _BLACKOUT_MULT)
+                        _blocked[idx] = time.monotonic() + cooldown
                         logger.warning(
-                            "LLM: все ключи на 429 → глобальный blackout %.0f с", wait
+                            "LLM: ключ %s → 429, cooldown %.0f с", key_name, cooldown
                         )
-                        # Уведомляем об исчерпании
-                        if _on_exhausted_cb:
-                            _fire_callback(_on_exhausted_cb("gemini"))
+
+                        # Логируем в БД
                         if _db_log_cb:
-                            _fire_callback(_db_log_cb(
-                                "gemini", "ALL", "all_keys_exhausted",
-                                f"All {len(_keys)} Gemini key(s) are rate-limited",
-                            ))
-                        return _stub(wait)
+                            _fire_callback(_db_log_cb("gemini", key_name, "error_429", err_str[:500]))
 
-                    # Есть резервный ключ — уведомляем пользователя
-                    if _on_failover_cb and _current_vk_id:
-                        _fire_callback(_on_failover_cb(_current_vk_id, "gemini"))
+                        # Проверяем: заблокированы ли ВСЕ ключи?
+                        now3 = time.monotonic()
+                        if all(now3 < t for t in _blocked):
+                            # Blackout = до момента когда самый поздний ключ освободится
+                            new_blackout = max(_blocked)
+                            if new_blackout > _blackout_until:
+                                _blackout_until = new_blackout
+                            wait = _blackout_until - now3
+                            logger.warning(
+                                "LLM: все ключи на 429 → глобальный blackout %.0f с", wait
+                            )
+                            # Уведомляем об исчерпании
+                            if _on_exhausted_cb:
+                                _fire_callback(_on_exhausted_cb("gemini"))
+                            if _db_log_cb:
+                                _fire_callback(_db_log_cb(
+                                    "gemini", "ALL", "all_keys_exhausted",
+                                    f"All {len(_keys)} Gemini key(s) are rate-limited",
+                                ))
+                            return _stub(wait)
 
-                    break  # перейти к следующему ключу
+                        # Есть резервный ключ — уведомляем пользователя
+                        if _on_failover_cb and _current_vk_id:
+                            _fire_callback(_on_failover_cb(_current_vk_id, "gemini"))
 
-                # ── Ошибка авторизации (невалидный ключ) ─────────────────────
-                if "401" in err_up or "UNAUTHENTICATED" in err_up or "API_KEY_INVALID" in err_up:
-                    _blocked[idx] = time.monotonic() + 3600.0  # на 1 час
-                    logger.error("LLM: ключ %s → ошибка авторизации", key_name)
-                    if _db_log_cb:
-                        _fire_callback(_db_log_cb("gemini", key_name, "error_auth", err_str[:500]))
-                    # Уведомляем если есть резерв
-                    now3 = time.monotonic()
-                    has_reserve = any(now3 >= t for i, t in enumerate(_blocked) if i != idx)
-                    if has_reserve and _on_failover_cb and _current_vk_id:
-                        _fire_callback(_on_failover_cb(_current_vk_id, "gemini"))
-                    break
+                        break  # перейти к следующему ключу
 
-                # ── Временные ошибки сервера ──────────────────────────────────
-                if (
-                    "500" in err_up or "503" in err_up
-                    or "UNAVAILABLE" in err_up or "TIMEOUT" in err_up
-                ) and attempt == 0:
-                    logger.warning(
-                        "LLM: transient error ключ %s, retry через 5 с: %s",
-                        key_name, exc,
-                    )
-                    await asyncio.sleep(5)
-                    continue  # повторить на том же ключе
+                    # ── Ошибка авторизации (невалидный ключ) ─────────────────────
+                    if "401" in err_up or "UNAUTHENTICATED" in err_up or "API_KEY_INVALID" in err_up:
+                        _blocked[idx] = time.monotonic() + 3600.0  # на 1 час
+                        logger.error("LLM: ключ %s → ошибка авторизации", key_name)
+                        if _db_log_cb:
+                            _fire_callback(_db_log_cb("gemini", key_name, "error_auth", err_str[:500]))
+                        # Уведомляем если есть резерв
+                        now3 = time.monotonic()
+                        has_reserve = any(now3 >= t for i, t in enumerate(_blocked) if i != idx)
+                        if has_reserve and _on_failover_cb and _current_vk_id:
+                            _fire_callback(_on_failover_cb(_current_vk_id, "gemini"))
+                        break
 
-                # ── Неизвестная ошибка — пробрасываем ────────────────────────
-                logger.error("LLM: ошибка ключ %s: %s", key_name, exc)
-                raise
+                    # ── Временные ошибки сервера ──────────────────────────────────
+                    if (
+                        "500" in err_up or "503" in err_up
+                        or "UNAVAILABLE" in err_up or "TIMEOUT" in err_up
+                    ) and attempt == 0:
+                        logger.warning(
+                            "LLM: transient error ключ %s, retry через 5 с: %s",
+                            key_name, exc,
+                        )
+                        await asyncio.sleep(5)
+                        continue  # повторить на том же ключе
+
+                    # ── Неизвестная ошибка — пробрасываем ────────────────────────
+                    logger.error("LLM: ошибка ключ %s: %s", key_name, exc)
+                    raise
 
     # Все доступные ключи исчерпаны
     now4 = time.monotonic()
@@ -394,6 +450,7 @@ def is_overloaded() -> tuple[bool, float]:
 
 # ─── Public API ────────────────────────────────────────────────────────────────
 
+@observe(name="gemini-analyze-photo")
 async def _analyze_one_photo(
     photo_data: bytes,
     mime: str,
@@ -440,6 +497,7 @@ async def _analyze_one_photo(
     )
 
 
+@observe(name="gemini-synthesize-photos")
 async def _synthesize_photo_analyses(
     analyses: list[str],
     user_request: str,
@@ -468,6 +526,7 @@ async def _synthesize_photo_analyses(
     )
 
 
+@observe(name="generate-response")
 async def generate_response(
     user_text: str,
     pet_name: str,
@@ -633,6 +692,7 @@ async def generate_response(
         raise
 
 
+@observe(name="extract-facts")
 async def extract_facts(
     message: str,
     pet_name: str,
@@ -668,6 +728,7 @@ async def extract_facts(
         return []
 
 
+@observe(name="classify-triage")
 async def classify_triage(
     message: str,
     pet_name: str,
@@ -696,6 +757,7 @@ async def classify_triage(
         return {"level": "observation", "topic_changed": False, "brief_action": ""}
 
 
+@observe(name="classify-intent")
 async def classify_intent(message: str) -> dict:
     """Быстрая классификация намерения."""
     try:

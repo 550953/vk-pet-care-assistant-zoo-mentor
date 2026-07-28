@@ -111,3 +111,27 @@ def extract_tavily_keys(secrets: dict[str, str]) -> list[tuple[str, str]]:
                 seen.add(val)
                 result.append((k, val))
     return result
+
+
+def extract_langfuse_config(secrets: dict[str, str]) -> Optional[dict[str, str]]:
+    """
+    Вытаскивает тройку LANGFUSE_PUBLIC_KEY_<suffix> / LANGFUSE_SECRET_KEY_<suffix> /
+    LANGFUSE_BASE_URL_<suffix> с общим suffix (например _550953 — по аналогии
+    с GEMINI_API_KEY_550953 и т.п.).
+
+    В отличие от Gemini/Groq/Tavily это не пул — Langfuse не нужен round-robin,
+    поэтому возвращаем один найденный набор, а не список.
+    Возвращает {"public_key", "secret_key", "host"} или None, если не найдено.
+    """
+    suffixes = {
+        k[len("LANGFUSE_PUBLIC_KEY_"):]
+        for k in secrets
+        if k.startswith("LANGFUSE_PUBLIC_KEY_")
+    }
+    for suffix in suffixes:
+        pub = secrets.get(f"LANGFUSE_PUBLIC_KEY_{suffix}", "").strip()
+        sec = secrets.get(f"LANGFUSE_SECRET_KEY_{suffix}", "").strip()
+        host = secrets.get(f"LANGFUSE_BASE_URL_{suffix}", "").strip() or "https://cloud.langfuse.com"
+        if pub and sec:
+            return {"public_key": pub, "secret_key": sec, "host": host}
+    return None

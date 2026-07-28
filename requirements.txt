@@ -6,3 +6,4 @@ aiohttp==3.11.10
 google-genai==2.14.0
 apscheduler==3.10.4
 gigachat==0.2.1
+langfuse>=3.6.0,<5
