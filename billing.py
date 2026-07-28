@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from models import User, UsageLog
+from logging_setup import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,10 @@ async def check_and_increment(session: AsyncSession, user: User, is_media: bool 
             # Trial expired → downgrade to free
             user.plan = "free"
             await session.commit()
+            log_event(
+                logger, logging.INFO, "trial_expired",
+                peer_id=user.vk_id, trial_days=TRIAL_DAYS,
+            )
 
     # Free plan: check daily limits
     today = date.today()
@@ -58,11 +63,21 @@ async def check_and_increment(session: AsyncSession, user: User, is_media: bool 
 
     if log:
         if is_media and log.media_count >= FREE_MEDIA_PER_DAY:
+            log_event(
+                logger, logging.INFO, "usage_limit_hit",
+                peer_id=user.vk_id, plan=user.plan, limit_type="media",
+                limit=FREE_MEDIA_PER_DAY,
+            )
             return False, (
                 f"⚠️ Лимит медиафайлов на сегодня исчерпан ({FREE_MEDIA_PER_DAY}/день на бесплатном тарифе).\n"
                 "Подключи подписку: /subscription"
             )
         if not is_media and log.messages_count >= FREE_MESSAGES_PER_DAY:
+            log_event(
+                logger, logging.INFO, "usage_limit_hit",
+                peer_id=user.vk_id, plan=user.plan, limit_type="messages",
+                limit=FREE_MESSAGES_PER_DAY,
+            )
             return False, (
                 f"⚠️ Лимит сообщений на сегодня исчерпан ({FREE_MESSAGES_PER_DAY}/день на бесплатном тарифе).\n"
                 "Подключи подписку: /subscription"
