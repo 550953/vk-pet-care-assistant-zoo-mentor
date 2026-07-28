@@ -49,6 +49,8 @@ import key_pool as kp
 import handlers
 import aiohttp
 
+from observability import langfuse, init_langfuse
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -227,6 +229,10 @@ async def lifespan(app: FastAPI):
         else:
             logger.warning("GigaChat: GIGACHAT_AUTH_KEY_* не найдены в Infisical — резервный LLM отключён")
 
+        # Langfuse — трейсинг LLM-вызовов (LANGFUSE_PUBLIC_KEY_*/LANGFUSE_SECRET_KEY_*/
+        # LANGFUSE_BASE_URL_* в Infisical, тем же suffix-паттерном, что GEMINI_API_KEY_*)
+        init_langfuse(infisical_secrets)
+
         # VK credentials from Infisical
         vk_token_inf = infisical_secrets.get("VK_TOKEN", "")
         vk_gid_inf = infisical_secrets.get("VK_GROUP_ID", "")
@@ -278,6 +284,10 @@ async def lifespan(app: FastAPI):
         if tavily_env:
             init_tavily_pool(tavily_env)
 
+        # Langfuse из env (fallback) — init_langfuse() сама читает
+        # LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY/LANGFUSE_HOST без суффикса
+        init_langfuse(None)
+
     # ── Задача 4: устанавливаем failover-колбэки для ВСЕХ пулов ─────────────
     kp.set_callbacks(
         on_failover=_on_key_failover,
@@ -315,6 +325,15 @@ async def lifespan(app: FastAPI):
 
     if vk:
         await vk.close()
+
+    # Langfuse батчит и отправляет трейсы асинхронно — без явного flush()
+    # последние трейсы перед остановкой процесса (деплой/рестарт на Render)
+    # могут не успеть уйти.
+    try:
+        langfuse.flush()
+        logger.info("Langfuse: трейсы сброшены перед остановкой")
+    except Exception as e:
+        logger.warning("Langfuse: ошибка при flush() — %s", e)
 
 
 app = FastAPI(lifespan=lifespan, title="ZOO Ментор")

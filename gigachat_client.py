@@ -22,9 +22,12 @@ from gigachat import GigaChat
 from gigachat.exceptions import GigaChatException
 from sqlalchemy import select, func
 
+from langfuse import propagate_attributes
+
 from key_pool import KeyPool
 from db import async_session
 from models import GigaChatUsage
+from observability import langfuse
 
 logger = logging.getLogger(__name__)
 
@@ -171,56 +174,76 @@ async def generate_gigachat(
         logger.debug("GigaChat: все ключи на cooldown")
         return None, "GigaChat временно недоступен"
 
+    messages: list[dict] = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+
+    propagate_kwargs: dict[str, Any] = {"tags": ["gigachat", "fallback", model]}
+    if current_vk_id:
+        propagate_kwargs["user_id"] = str(current_vk_id)
+
     async with _GIGACHAT_SEMAPHORE:
-        try:
-            async with GigaChat(
-                credentials=api_key,
-                scope="GIGACHAT_API_PERS",
-                model=model,
-                verify_ssl_certs=False,  # см. примечание в SKILL/README — заменить на
-                                         # verify_ssl_certs=True + сертификаты НУЦ Минцифры
-                                         # при переходе с теста на постоянную эксплуатацию
-            ) as client:
-                messages: list[dict] = []
-                if system:
-                    messages.append({"role": "system", "content": system})
-                messages.append({"role": "user", "content": prompt})
+      with langfuse.start_as_current_observation(
+          as_type="generation",
+          name="gigachat-fallback-generate",
+          model=model,
+          input=messages,
+          metadata={"fallback_reason": "gemini_blackout"},
+      ) as generation:
+        with propagate_attributes(**propagate_kwargs):
+            try:
+                async with GigaChat(
+                    credentials=api_key,
+                    scope="GIGACHAT_API_PERS",
+                    model=model,
+                    verify_ssl_certs=False,  # см. примечание в SKILL/README — заменить на
+                                             # verify_ssl_certs=True + сертификаты НУЦ Минцифры
+                                             # при переходе с теста на постоянную эксплуатацию
+                ) as client:
+                    response = await client.achat({"messages": messages})
 
-                response = await client.achat({"messages": messages})
+                choice = response.choices[0] if response.choices else None
+                text = choice.message.content.strip() if choice else ""
 
-            choice = response.choices[0] if response.choices else None
-            text = choice.message.content.strip() if choice else ""
+                usage = getattr(response, "usage", None)
+                in_tok = getattr(usage, "prompt_tokens", 0) or 0
+                out_tok = getattr(usage, "completion_tokens", 0) or 0
+                logger.info("GigaChat tokens: in=%s out=%s model=%s", in_tok, out_tok, model)
 
-            usage = getattr(response, "usage", None)
-            in_tok = getattr(usage, "prompt_tokens", 0) or 0
-            out_tok = getattr(usage, "completion_tokens", 0) or 0
-            logger.info("GigaChat tokens: in=%s out=%s model=%s", in_tok, out_tok, model)
+                generation.update(
+                    output=text,
+                    usage_details={"input": in_tok, "output": out_tok},
+                )
 
-            if _on_usage_cb:
-                _fire(_on_usage_cb(model, in_tok, out_tok))
+                if _on_usage_cb:
+                    _fire(_on_usage_cb(model, in_tok, out_tok))
 
-            if not text:
-                return None, "GigaChat вернул пустой ответ"
-            return text, None
+                if not text:
+                    generation.update(level="WARNING", status_message="empty response")
+                    return None, "GigaChat вернул пустой ответ"
+                return text, None
 
-        except GigaChatException as exc:
-            err_str = str(exc)
-            logger.warning("GigaChat: ошибка — %s", err_str)
-            # Не знаем точных кодов rate-limit у GigaChat заранее — ставим
-            # консервативный cooldown на конкретный ключ через mark_error,
-            # это же логирует событие в БД через уже подключённый db_log колбэк.
-            _pool.mark_error(
-                idx, "error_gigachat", err_str,
-                cooldown=_pool.blackout_min * 60.0,
-                current_vk_id=current_vk_id,
-            )
-            return None, "GigaChat временно недоступен"
+            except GigaChatException as exc:
+                err_str = str(exc)
+                logger.warning("GigaChat: ошибка — %s", err_str)
+                generation.update(level="ERROR", status_message=err_str[:500])
+                # Не знаем точных кодов rate-limit у GigaChat заранее — ставим
+                # консервативный cooldown на конкретный ключ через mark_error,
+                # это же логирует событие в БД через уже подключённый db_log колбэк.
+                _pool.mark_error(
+                    idx, "error_gigachat", err_str,
+                    cooldown=_pool.blackout_min * 60.0,
+                    current_vk_id=current_vk_id,
+                )
+                return None, "GigaChat временно недоступен"
 
-        except Exception as exc:
-            logger.error("GigaChat: неожиданная ошибка — %s", exc)
-            _pool.mark_error(
-                idx, "error_unknown", str(exc),
-                cooldown=60.0,
-                current_vk_id=current_vk_id,
-            )
-            return None, "GigaChat временно недоступен"
+            except Exception as exc:
+                logger.error("GigaChat: неожиданная ошибка — %s", exc)
+                generation.update(level="ERROR", status_message=str(exc)[:500])
+                _pool.mark_error(
+                    idx, "error_unknown", str(exc),
+                    cooldown=60.0,
+                    current_vk_id=current_vk_id,
+                )
+                return None, "GigaChat временно недоступен"
