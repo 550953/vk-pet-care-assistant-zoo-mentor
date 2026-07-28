@@ -50,11 +50,9 @@ import handlers
 import aiohttp
 
 from observability import langfuse, init_langfuse
+from logging_setup import setup_logging, new_correlation_id, set_peer_id, log_event
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
+setup_logging()
 logger = logging.getLogger(__name__)
 
 vk: VKClient | None = None
@@ -373,6 +371,19 @@ async def handle_message(msg: dict) -> None:
 
     if not vk_id or vk_id < 0:
         return  # Skip group/bot messages
+
+    new_correlation_id()
+    set_peer_id(vk_id)
+
+    attachments = msg.get("attachments") or []
+    log_event(
+        logger, logging.INFO, "message_received",
+        peer_id=vk_id,
+        text_preview=text[:80] if text else None,
+        text_len=len(text),
+        attachments=[a.get("type") for a in attachments] if attachments else None,
+        msg_id=msg.get("id"),
+    )
 
     async with async_session() as session:
         user = await ensure_user(session, vk_id)

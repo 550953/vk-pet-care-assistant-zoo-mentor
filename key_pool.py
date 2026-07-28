@@ -7,6 +7,8 @@ import logging
 import time
 from typing import Optional, Callable, Awaitable, Any
 
+from logging_setup import log_event
+
 logger = logging.getLogger(__name__)
 
 # ─── Глобальные колбэки, устанавливаются из main.py после старта ─────────────
@@ -133,9 +135,10 @@ class KeyPool:
 
         if cooldown > 0:
             self.blocked[idx] = time.monotonic() + cooldown
-            logger.warning(
-                "%s: ключ %s → %s, cooldown %.0f с",
-                self.service, key_name, error_type, cooldown,
+            log_event(
+                logger, logging.WARNING, "key_marked_error",
+                service=self.service, key_name=key_name, error_type=error_type,
+                cooldown_s=round(cooldown, 0),
             )
 
         # Проверяем: есть ли хоть один незаблокированный ключ?
@@ -144,6 +147,12 @@ class KeyPool:
 
         if available:
             # Есть резервный — уведомляем пользователя мягко
+            log_event(
+                logger, logging.WARNING, "key_failover",
+                service=self.service, old_key=key_name,
+                new_key=self.key_names[available[0]] if available[0] < len(self.key_names) else None,
+                remaining_keys=len(available),
+            )
             if _on_failover_cb and current_vk_id:
                 _fire(_on_failover_cb(current_vk_id, self.service))
             return True
@@ -152,9 +161,10 @@ class KeyPool:
             new_blackout = max(self.blocked) if self.blocked else 0.0
             if new_blackout > self.blackout_until:
                 self.blackout_until = new_blackout
-            logger.critical(
-                "CRITICAL: %s: ВСЕ ключи исчерпаны! blackout до %.0f с",
-                self.service, max(0.0, self.blackout_until - now),
+            log_event(
+                logger, logging.CRITICAL, "keys_exhausted",
+                service=self.service, total_keys=len(self.keys),
+                blackout_s=round(max(0.0, self.blackout_until - now), 0),
             )
             # Логируем критическое событие
             if _db_log_cb:

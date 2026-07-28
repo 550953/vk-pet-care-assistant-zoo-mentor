@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from llm import classify_triage
+from logging_setup import log_event
 
 # Быстрый keyword-фильтр — LLM вызывается только если хотя бы одно слово совпало.
 # Для обычных вопросов ("разбери состав", "привет") LLM-вызов полностью пропускается.
@@ -91,9 +92,10 @@ async def analyze_triage(
     Also handles topic_changed to exit emergency mode.
     """
     emergency_active = is_emergency_active(user_id, pet_id)
+    keyword_matched = _needs_triage_llm(message)
 
     # Пропускаем LLM-вызов если нет ни тревожных слов, ни активного режима экстренной ситуации
-    if not emergency_active and not _needs_triage_llm(message):
+    if not emergency_active and not keyword_matched:
         return None
 
     result = await classify_triage(message, pet_name, species, emergency_active)
@@ -101,6 +103,19 @@ async def analyze_triage(
     level = result.get("level", "observation")
     topic_changed = result.get("topic_changed", False)
     brief_action = result.get("brief_action", "")
+
+    log_event(
+        logger,
+        logging.WARNING if level in ("emergency", "urgent") else logging.INFO,
+        "triage_result",
+        peer_id=user_id,
+        pet_id=pet_id,
+        triage_level=level,
+        keyword_matched=keyword_matched,
+        emergency_was_active=emergency_active,
+        topic_changed=topic_changed,
+        brief_action=brief_action[:200] if brief_action else None,
+    )
 
     # If was in emergency and user changed topic — exit emergency mode
     if emergency_active and topic_changed:
